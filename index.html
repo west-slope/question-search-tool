@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src data: blob:; font-src 'self' blob: data:; base-uri 'none'; form-action 'none'">
   <title>题库速查</title>
   <style>
     :root {
@@ -49,6 +49,7 @@
     .intro h1 { overflow-wrap: anywhere; }
     .import-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 12px 15px; margin-bottom: 20px; border: 1px dashed #aab9d8; border-radius: 12px; background: #fbfcff; }
     .import-panel.dragging { background: var(--blue-light); border-color: var(--blue); }
+    #query-panel.dragging { background: var(--blue-light); border-color: var(--blue); }
     .import-panel .more-button { margin: 0; }
     .import-message { flex: 1 1 210px; color: var(--muted); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
     .import-message.error { color: #9a3434; }
@@ -76,6 +77,9 @@
     .actions .quiet:hover { color: var(--blue); background: var(--blue-light); }
     .shortcut, .clipboard-tip { margin-top: 11px; color: var(--muted); font-size: 12px; line-height: 1.65; }
     .clipboard-tip { color: var(--blue-dark); }
+    .ocr-status { min-height: 0; margin-top: 10px; color: var(--blue-dark); font-size: 13px; line-height: 1.55; }
+    .ocr-status:empty { display: none; }
+    .ocr-status.error { color: #9a3434; }
     kbd { padding: 1px 4px; border: 1px solid var(--line); border-radius: 4px; background: var(--page); color: var(--ink); font: inherit; font-weight: 600; white-space: nowrap; }
 
     .examples { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; padding-top: 14px; margin-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
@@ -156,7 +160,7 @@
   <header class="masthead">
     <div class="wrap">
       <div class="brand"><span class="brand-icon" aria-hidden="true"><span class="magnifier"></span></span>题库速查</div>
-      <span class="offline">离线可用</span>
+      <span class="offline">本地处理</span>
     </div>
   </header>
 
@@ -167,24 +171,27 @@
     </div>
 
     <div class="import-panel" id="import-panel">
-      <input id="workbook" type="file" accept=".xlsx,.docx,.md,.markdown,.txt,.csv,.tsv" multiple hidden>
+      <input id="workbook" type="file" accept=".xlsx,.docx,.md,.markdown,.txt,.csv,.tsv,.pdf" multiple hidden>
       <button class="more-button" type="button" id="choose-bank">添加题库文件</button>
-      <p class="import-message" id="import-message" role="status">可一次拖入多份 XLSX、DOCX、MD、TXT、CSV 或 TSV</p>
+      <p class="import-message" id="import-message" role="status">可一次拖入多份 XLSX、DOCX、MD、TXT、CSV、TSV 或 PDF</p>
       <ul class="imported-files" id="imported-files" aria-label="已导入的题库" hidden></ul>
     </div>
 
     <div class="workbench">
-      <section class="panel" aria-labelledby="query-title">
-        <h2 id="query-title"><label for="query">粘贴题目</label></h2>
-        <p class="instructions" id="query-help">粘贴整题、只粘贴题干，或输入关键词。</p>
+      <section class="panel" id="query-panel" aria-labelledby="query-title">
+        <h2 id="query-title"><label for="query">查找题目</label></h2>
+        <p class="instructions" id="query-help">粘贴题干或截图，也可以输入关键词。截图尽量只包含一道题。</p>
         <textarea id="query" aria-describedby="query-help" placeholder="把复制的题目粘贴到这里…" spellcheck="false" autocapitalize="off" maxlength="4000" autofocus></textarea>
         <div class="actions">
           <button class="primary" id="search" type="button">查询题库</button>
           <button class="secondary" id="paste" type="button">从剪贴板粘贴</button>
+          <button class="secondary" id="choose-screenshot" type="button">选择截图</button>
+          <input id="screenshot" type="file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" hidden>
           <button class="quiet" id="clear" type="button" hidden>清空</button>
         </div>
         <p class="shortcut"><kbd id="paste-shortcut">Ctrl + V</kbd> 粘贴新题并查询</p>
         <p class="clipboard-tip" id="clipboard-tip" role="status" hidden></p>
+        <p class="ocr-status" id="ocr-status" role="status"></p>
         <div class="examples" id="examples" hidden></div>
       </section>
 
@@ -379,6 +386,7 @@ function createQuestionSearch(questions) {
     const found = [];
     for (const entry of entries) {
       const match = stemMatch(entry.key, query);
+      if (!match) continue;
       let agreement = 0;
       if (query.optionKeys.size >= 2 && entry.optionKeys.size >= 2) {
         let shared = 0;
@@ -388,17 +396,13 @@ function createQuestionSearch(questions) {
         agreement = shared / Math.max(query.optionKeys.size, entry.optionKeys.size);
       }
 
-      if (match) {
-        found.push({
-          question: entry.question,
-          mode: match.mode,
-          score: match.score + 0.26 * agreement,
-        });
-      } else if (agreement >= 0.75 && query.optionKeys.size >= 3) {
-        found.push({ question: entry.question, mode: "options", score: 0.68 + 0.26 * agreement });
-      }
+      found.push({
+        question: entry.question,
+        mode: match.mode,
+        score: match.score + 0.08 * agreement,
+      });
     }
-    found.sort((a, b) => b.score - a.score);
+    found.sort((a, b) => Number(b.mode === "exact") - Number(a.mode === "exact") || b.score - a.score);
     if (!found.length) return { query, matches: [] };
 
     const top = found[0];
@@ -600,7 +604,7 @@ function cleanAnswer(answer) {
   return answer.replace(/\s*(?:【(?:答案)?解析】|(?:答案)?解析\s*[:：]|explanation\s*:).*$/i, "").trim();
 }
 
-function parseTextQuestions(lines) {
+function parseTextQuestions(lines, locations = []) {
   const drafts = [];
   const answerKeys = new Map();
   let draft = null;
@@ -608,6 +612,7 @@ function parseTextQuestions(lines) {
   let keySection = false;
   let title = "";
   let sawBlank = false;
+  let location = "正文";
 
   function finish() {
     if (draft?.stem.length) drafts.push(draft);
@@ -616,10 +621,11 @@ function parseTextQuestions(lines) {
 
   function start(stem = "", number = "") {
     finish();
-    draft = { stem: stem ? [stem] : [], number, kind: section, options: [], marked: [], rawAnswer: "", waitingAnswer: false, explicit: true };
+    draft = { stem: stem ? [stem] : [], number, kind: section, options: [], marked: [], rawAnswer: "", waitingAnswer: false, explicit: true, location };
   }
 
-  for (const raw of lines) {
+  for (const [index, raw] of lines.entries()) {
+    location = locations[index] || location;
     const line = cleanTextLine(raw);
     if (!line) { sawBlank = true; continue; }
     const blankBefore = sawBlank;
@@ -704,7 +710,7 @@ function parseTextQuestions(lines) {
     }
     const options = item.options;
     const answer = extractAnswer(rawAnswer, options);
-    questions.push({ sheet: "正文", number: item.number || String(questions.length + 1), stem: item.stem.join("\n"),
+    questions.push({ sheet: item.location, number: item.number || String(questions.length + 1), stem: item.stem.join("\n"),
       kind: item.kind || (answer.judgment ? "判断题" : options.length ? (answer.answer.length > 1 ? "多选题" : "单选题") : ""),
       options, ...answer });
   }
@@ -802,13 +808,16 @@ function decodeBankText(buffer) {
   catch { return new TextDecoder("gb18030").decode(bytes); }
 }
 
-async function importBankFile(file) {
+async function importBankFile(file, onProgress) {
   const ext = file.name.split(".").at(-1).toLowerCase();
-  if (!["xlsx", "docx", "md", "markdown", "txt", "csv", "tsv"].includes(ext)) throw new Error("支持 XLSX、DOCX、MD、TXT、CSV 和 TSV。");
+  if (!["xlsx", "docx", "md", "markdown", "txt", "csv", "tsv", "pdf"].includes(ext)) throw new Error("支持 XLSX、DOCX、MD、TXT、CSV、TSV 和 PDF。");
   if (file.size > 16 * 1024 * 1024) throw new Error("单个文件需小于 16 MB。");
   const buffer = await file.arrayBuffer();
+  const digest = await globalThis.crypto?.subtle?.digest("SHA-256", buffer).catch(() => null);
   let result;
-  if (ext === "xlsx" || ext === "docx") {
+  if (ext === "pdf") {
+    result = await importPdf(buffer, onProgress);
+  } else if (ext === "xlsx" || ext === "docx") {
     const zip = await JSZip.loadAsync(buffer).catch(() => { throw new Error("无法打开 Office 文件，请检查是否损坏或加密。"); });
     result = ext === "xlsx" ? await importWorkbook(zip, file.name) : await importWord(zip);
   } else {
@@ -818,10 +827,209 @@ async function importBankFile(file) {
     else result = parseTextQuestions(text.split(/\r\n?|\n/));
   }
   if (!result.questions.length) throw new Error("没有识别到带答案的题目。请检查题干、答案列或正文中的答案标记。");
-  const digest = await globalThis.crypto?.subtle?.digest("SHA-256", buffer).catch(() => null);
   const id = digest ? Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")
     : JSON.stringify([file.name, file.size, file.lastModified]);
   return { ...result, fileName: file.name, title: result.title || file.name.replace(/\.[^.]+$/, ""), id };
+}
+</script>
+  <script>
+function isScreenshot(file) {
+  return /^(?:image\/(?:png|jpeg|webp))$/i.test(file.type) || /\.(?:png|jpe?g|webp)$/i.test(file.name || "");
+}
+
+async function prepareScreenshot(file) {
+  if (file.size > 16 * 1024 * 1024) throw new Error("请选择 16 MB 以内的截图。");
+  const bitmap = await createImageBitmap(file).catch(() => { throw new Error("无法打开图片。请选用 PNG、JPG 或 WebP 截图。"); });
+  try {
+    const scale = Math.min(2800 / Math.max(bitmap.width, bitmap.height), 2, Math.max(1, 1200 / bitmap.width));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const draw = canvas.getContext("2d", { alpha: false });
+    draw.fillStyle = "white";
+    draw.fillRect(0, 0, canvas.width, canvas.height);
+    draw.imageSmoothingQuality = "high";
+    draw.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return await new Promise((resolve, reject) => canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("截图解码失败，请重新选择图片。"));
+    }, "image/png"));
+  } finally { bitmap.close(); }
+}
+
+function createScreenshotReader(onProgress) {
+  const files = new URL("./ocr/", location.href);
+  let worker;
+  let loading;
+
+  function loadEngine() {
+    if (globalThis.Tesseract) return Promise.resolve();
+    if (loading) return loading;
+    loading = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = new URL("tesseract.min.js", files).href;
+      script.onload = resolve;
+      script.onerror = () => {
+        script.remove();
+        loading = null;
+        reject(new Error("识别组件加载失败，请刷新页面后重试。"));
+      };
+      document.head.append(script);
+    });
+    return loading;
+  }
+
+  async function recognize(file) {
+    if (!/^https?:$/.test(location.protocol)) throw new Error("请从 GitHub Pages 网页打开截图查询。离线 HTML 可继续查询文字。");
+    const image = await prepareScreenshot(file);
+    try {
+      if (!worker) {
+        await loadEngine();
+        let deadline;
+        worker = await new Promise((resolve, reject) => {
+          deadline = setTimeout(() => reject(new Error("OCR initialization timed out")), 75000);
+          Tesseract.createWorker("chi_sim+eng", 1, {
+            workerPath: new URL("worker.min.js", files).href,
+            workerBlobURL: false,
+            corePath: new URL("core/", files).href,
+            langPath: new URL("lang", files).href,
+            logger: onProgress,
+            errorHandler: reject,
+          }).then(resolve, reject);
+        }).finally(() => clearTimeout(deadline));
+      }
+      const { data } = await worker.recognize(image);
+      return data.text.trim().replace(/(?<=\p{Script=Han})[ \t]+(?=\p{Script=Han})/gu, "")
+        .replace(/^([A-H]|\d+)[ \t]*[。．][ \t]*/gim, "$1. ");
+    } catch {
+      if (worker) await worker.terminate().catch(() => {});
+      worker = null;
+      throw new Error("截图识别失败。请稍后重试，或先用文字查询。");
+    }
+  }
+
+  return {
+    recognize,
+    async close() {
+      if (!worker) return;
+      try { await worker.terminate(); } finally { worker = null; }
+    },
+  };
+}
+</script>
+  <script>
+function pdfRows(items) {
+  const points = items.filter((item) => item.str?.trim()).map((item) => ({
+    text: item.str, x: item.transform[4], y: item.transform[5], width: item.width,
+  })).sort((a, b) => b.y - a.y || a.x - b.x);
+  const rows = [];
+  for (const point of points) {
+    const row = rows.at(-1);
+    if (!row || row[0].y - point.y > 3) rows.push([point]);
+    else row.push(point);
+  }
+  return rows.map((row) => row.sort((a, b) => a.x - b.x));
+}
+
+function joinPdfRow(row) {
+  return row.map((part, index) => {
+    const previous = row[index - 1];
+    return (previous && part.x - (previous.x + previous.width) > 2 ? " " : "") + part.text;
+  }).join("").trim();
+}
+
+function pdfTable(rows, place) {
+  for (let header = 0; header < rows.length; header++) {
+    const parts = rows[header];
+    const columns = parts.map((part) => part.text.trim());
+    if (!detectColumns(columns)) continue;
+    const body = rows.slice(header + 1).map((row) => {
+      const cells = parts.map(() => []);
+      for (const piece of row) {
+        const col = parts.findLastIndex(({ x }) => x <= piece.x + 3);
+        cells[Math.max(0, col)].push(piece);
+      }
+      return cells.map(joinPdfRow);
+    });
+    return extractSheet(rowsFromCells([columns, ...body]), place);
+  }
+  return null;
+}
+
+async function rasterizePage(page) {
+  const bounds = page.getViewport({ scale: 1 });
+  const viewport = page.getViewport({ scale: Math.min(2.4, 2600 / Math.max(bounds.width, bounds.height)) });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  try {
+    await page.render({ canvas, canvasContext: canvas.getContext("2d"), viewport }).promise;
+    return await new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("无法渲染 PDF 页")), "image/png"));
+  } finally {
+    canvas.width = canvas.height = 0;
+  }
+}
+
+async function importPdf(buffer, onProgress = () => {}) {
+  if (!/^https?:$/.test(location.protocol)) throw new Error("请通过 GitHub Pages 网页导入 PDF。");
+  const assets = new URL("./pdf/", location.href);
+  const library = await import(new URL("pdf.min.mjs", assets).href).catch(() => { throw new Error("PDF 读取组件加载失败，请刷新后重试。"); });
+  library.GlobalWorkerOptions.workerSrc = new URL("pdf.worker.min.mjs", assets).href;
+  library.GlobalWorkerOptions.rendererSrc = new URL("pdf.renderer.min.mjs", assets).href;
+  const task = library.getDocument({
+    data: new Uint8Array(buffer),
+    cMapPacked: true,
+    cMapUrl: new URL("cmaps/", assets).href,
+    standardFontDataUrl: new URL("standard_fonts/", assets).href,
+    wasmUrl: new URL("wasm/", assets).href,
+    iccUrl: new URL("iccs/", assets).href,
+    isEvalSupported: false,
+    enableXfa: false,
+  });
+  const output = { title: "", questions: [], skipped: 0, unreadPages: 0 };
+  const lines = [];
+  const locations = [];
+  let imageReader;
+  try {
+    let pdf;
+    try { pdf = await task.promise; } catch (error) {
+      if (error.name === "PasswordException") throw new Error("PDF 有密码保护，请先解锁后再导入。");
+      throw new Error("无法打开 PDF，文件可能已损坏。");
+    }
+    const metadata = await pdf.getMetadata().catch(() => null);
+    output.title = metadata?.info?.Title?.trim() || "";
+    for (let number = 1; number <= pdf.numPages; number++) {
+      onProgress(`正在读取第 ${number}/${pdf.numPages} 页`);
+      const place = `PDF 第 ${number} 页`;
+      const page = await pdf.getPage(number);
+      try {
+        const rows = pdfRows((await page.getTextContent()).items);
+        const table = pdfTable(rows, place);
+        if (table?.questions.length) {
+          mergeParsed(output, table);
+          continue;
+        }
+        let text = rows.map(joinPdfRow).join("\n");
+        if (lookupKey(text).length < 15 || (rows.length <= 2 && !/(?:答案|answer)/i.test(text))) {
+          onProgress(`正在识别扫描页 ${number}/${pdf.numPages}`);
+          try {
+            imageReader ||= createScreenshotReader(() => {});
+            text = await imageReader.recognize(await rasterizePage(page));
+          } catch { output.unreadPages++; continue; }
+          if (!lookupKey(text)) { output.unreadPages++; continue; }
+        }
+        for (const line of text.split(/\r?\n/)) {
+          lines.push(line);
+          locations.push(place);
+        }
+      } finally { page.cleanup(); }
+    }
+    mergeParsed(output, parseTextQuestions(lines, locations));
+    return output;
+  } finally {
+    await imageReader?.close().catch(() => {});
+    await task.destroy().catch(() => {});
+  }
 }
 </script>
   <script>
@@ -843,7 +1051,6 @@ async function importBankFile(file) {
     fragment: "题干片段",
     similar: "相近题目",
     keywords: "关键词匹配",
-    options: "选项匹配",
   };
   const pageSize = 6;
   let current = { query: null, matches: [] };
@@ -851,6 +1058,14 @@ async function importBankFile(file) {
   let visible = pageSize;
   let scheduled;
   let composing = false;
+  let queryRevision = 0;
+  let recognizing = false;
+  const ocrStatus = byId("ocr-status");
+  const screenshotButton = byId("choose-screenshot");
+  const screenshotPicker = byId("screenshot");
+  const imageReader = createScreenshotReader(({ status, progress }) => {
+    if (status === "recognizing text") screenshotMessage(`正在识别截图 ${Math.round(progress * 100)}%…`);
+  });
 
   byId("paste-shortcut").textContent = pasteShortcut;
 
@@ -1082,6 +1297,7 @@ async function importBankFile(file) {
   }
 
   function setQuery(text) {
+    queryRevision++;
     input.value = text.trim().slice(0, input.maxLength);
     clipboardTip.hidden = true;
     input.focus({ preventScroll: true });
@@ -1102,6 +1318,7 @@ async function importBankFile(file) {
   }
 
   input.addEventListener("input", (event) => {
+    queryRevision++;
     if (!composing && !event.isComposing) scheduleSearch();
   });
   input.addEventListener("compositionstart", () => {
@@ -1118,7 +1335,49 @@ async function importBankFile(file) {
       runSearch(true);
     }
   });
+  function screenshotMessage(text, error = false) {
+    ocrStatus.textContent = text;
+    ocrStatus.classList.toggle("error", error);
+  }
+
+  async function searchScreenshot(file) {
+    if (!file) return;
+    if (recognizing) return;
+    if (!isScreenshot(file)) {
+      screenshotMessage("请选择 PNG、JPG 或 WebP 截图。", true);
+      return;
+    }
+    const revision = queryRevision;
+    recognizing = screenshotButton.disabled = true;
+    screenshotMessage("正在读取截图，首次使用需加载识别模型…");
+    try {
+      const text = await imageReader.recognize(file);
+      if (!lookupKey(text)) screenshotMessage("没识别到文字，请裁剪到题目位置后重试。", true);
+      else if (revision !== queryRevision) screenshotMessage("当前查询文字已更改。重新粘贴截图即可识别该图。");
+      else {
+        setQuery(text);
+        screenshotMessage(search ? "已识别截图。可以修正输入框里的文字。" : "已识别截图。导入题库后会自动查找。");
+        revealMobileResults();
+      }
+    } catch (error) {
+      screenshotMessage(error.message || "无法识别截图。", true);
+    } finally {
+      recognizing = screenshotButton.disabled = false;
+    }
+  }
+
+  screenshotButton.addEventListener("click", () => screenshotPicker.click());
+  screenshotPicker.addEventListener("change", () => {
+    searchScreenshot(screenshotPicker.files[0]);
+    screenshotPicker.value = "";
+  });
   document.addEventListener("paste", (event) => {
+    const image = [...(event.clipboardData?.files || [])].find(isScreenshot);
+    if (image) {
+      event.preventDefault();
+      searchScreenshot(image);
+      return;
+    }
     const text = event.clipboardData?.getData("text/plain");
     if (!text?.trim()) return;
     event.preventDefault();
@@ -1129,13 +1388,23 @@ async function importBankFile(file) {
     runSearch(true);
     revealMobileResults();
   });
-  byId("clear").addEventListener("click", () => setQuery(""));
+  byId("clear").addEventListener("click", () => {
+    screenshotMessage("");
+    setQuery("");
+  });
   byId("paste").addEventListener("click", async (event) => {
     const control = event.currentTarget;
     const previous = input.value;
     control.disabled = true;
     try {
-      const text = await navigator.clipboard.readText();
+      const contents = await navigator.clipboard.read?.().catch(() => null);
+      const image = contents?.flatMap((item) => item.types.map((type) => ({ type, item }))).find(isScreenshot);
+      if (image) {
+        await searchScreenshot(await image.item.getType(image.type));
+        return;
+      }
+      const plain = contents?.find((item) => item.types.includes("text/plain"));
+      const text = plain ? await (await plain.getType("text/plain")).text() : await navigator.clipboard.readText();
       if (input.value !== previous) return;
       if (text.trim()) {
         setQuery(text);
@@ -1158,7 +1427,8 @@ async function importBankFile(file) {
   const picker = byId("workbook");
   const chooser = byId("choose-bank");
   const message = byId("import-message");
-  const dropHint = "可一次拖入多份 XLSX、DOCX、MD、TXT、CSV 或 TSV";
+  const dropHint = "可一次拖入多份 XLSX、DOCX、MD、TXT、CSV、TSV 或 PDF";
+  const queryPanel = byId("query-panel");
   let importing = false;
 
   function importMessage(text, error = false) {
@@ -1194,7 +1464,7 @@ async function importBankFile(file) {
       for (const [i, file] of files.entries()) {
         importMessage(`正在读取 ${i + 1}/${files.length} · ${file.name}…`);
         try {
-          const loaded = await importBankFile(file);
+          const loaded = await importBankFile(file, (progress) => importMessage(`${file.name} · ${progress}`));
           if (sources.some((source) => source.id === loaded.id || (source.id.startsWith("legacy:") && source.fileName === loaded.fileName && JSON.stringify(source.questions) === JSON.stringify(loaded.questions)))) {
             notes.push(`${file.name} 已导入`);
             continue;
@@ -1202,6 +1472,7 @@ async function importBankFile(file) {
           sources.push(loaded);
           added++;
           if (loaded.skipped) notes.push(`${file.name} 跳过 ${loaded.skipped} 道缺少题干或答案的记录`);
+          if (loaded.unreadPages) notes.push(`${file.name} 有 ${loaded.unreadPages} 页未读出文字`);
         } catch (error) {
           errors++;
           notes.push(`${file.name}：${error.message || "读取失败"}`);
@@ -1224,16 +1495,26 @@ async function importBankFile(file) {
   document.addEventListener("dragover", (event) => {
     if (!event.dataTransfer?.types.includes("Files")) return;
     event.preventDefault();
-    importPanel.classList.add("dragging");
+    const image = [...event.dataTransfer.items].some(isScreenshot);
+    queryPanel.classList.toggle("dragging", image);
+    importPanel.classList.toggle("dragging", !image);
   });
   document.addEventListener("dragleave", (event) => {
-    if (!event.relatedTarget) importPanel.classList.remove("dragging");
+    if (!event.relatedTarget) {
+      importPanel.classList.remove("dragging");
+      queryPanel.classList.remove("dragging");
+    }
   });
-  document.addEventListener("drop", (event) => {
+  document.addEventListener("drop", async (event) => {
     importPanel.classList.remove("dragging");
+    queryPanel.classList.remove("dragging");
     if (!event.dataTransfer?.files.length) return;
     event.preventDefault();
-    loadFiles([...event.dataTransfer.files]);
+    const files = [...event.dataTransfer.files];
+    const images = files.filter(isScreenshot);
+    await loadFiles(files.filter((file) => !isScreenshot(file)));
+    if (images.length === 1) searchScreenshot(images[0]);
+    else if (images.length) screenshotMessage("请一次粘贴或拖入一张截图。", true);
   });
 
   try {
